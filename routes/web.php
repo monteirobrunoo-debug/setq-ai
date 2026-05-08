@@ -17,6 +17,10 @@ Route::prefix('demo')->group(function () {
     Route::post('/{agent}/stream', [SetqChatController::class, 'stream'])
         ->where('agent', 'assistant|operations|growth|insights')
         ->name('demo.stream');
+
+    Route::post('/{agent}/reset', [SetqChatController::class, 'reset'])
+        ->where('agent', 'assistant|operations|growth|insights')
+        ->name('demo.reset');
 });
 
 // Lead capture — buyer leaves email after enjoying the demo

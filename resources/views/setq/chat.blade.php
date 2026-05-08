@@ -226,8 +226,15 @@
 <script>
 const AGENT       = @json($agent);
 const STREAM_URL  = "{{ route('demo.stream', $agent) }}";
+const RESET_URL   = "{{ route('demo.reset',  $agent) }}";
 const LEAD_URL    = "{{ route('leads.store') }}";
 const CSRF        = "{{ csrf_token() }}";
+// Server-driven absolute expiry — used for both the visible countdown
+// AND for forcing the expired UI when 0 is reached. No more "refresh
+// to actually log out" shenanigans (was a bug — client-only timer).
+const EXPIRES_AT  = {{ $expiresAtSec }};         // unix seconds, server time
+const SERVER_NOW  = {{ time() }};                 // unix seconds, server time at render
+const CLIENT_OFFSET = Date.now() / 1000 - SERVER_NOW;  // for clock skew
 const chatEl      = document.getElementById('chat');
 const emptyEl     = document.getElementById('empty');
 const messageEl   = document.getElementById('message');
@@ -274,19 +281,63 @@ async function submitLead(e) {
   return false;
 }
 
-// 15-min countdown — visual only; server enforces via Cache TTL
-let secondsLeft = 15 * 60;
-setInterval(() => {
-  secondsLeft = Math.max(0, secondsLeft - 1);
+// Server-driven countdown — uses absolute EXPIRES_AT from server.
+// When it hits zero we LOCK the UI (input disabled, expired panel shown)
+// AND show a "Start fresh demo" button that calls /demo/{agent}/reset
+// to wipe the cookie + sandbox + reload the page. No manual refresh needed.
+let expired = false;
+function tickTimer() {
+  const nowServerSec = (Date.now() / 1000) - CLIENT_OFFSET;
+  const secondsLeft  = Math.max(0, Math.floor(EXPIRES_AT - nowServerSec));
   const m = String(Math.floor(secondsLeft / 60)).padStart(2, '0');
   const s = String(secondsLeft % 60).padStart(2, '0');
   timerEl.textContent = `${m}:${s}`;
-  if (secondsLeft === 0) {
-    sendBtn.disabled = true;
+  if (secondsLeft <= 60) timerEl.style.color = '#ffc850';
+  if (secondsLeft === 0 && !expired) {
+    expired = true;
     timerEl.style.color = '#ff4444';
-    addMsg('ai', 'Demo expired. Refresh the page to start a new 15-minute sandbox.', true);
+    showExpiredOverlay();
   }
-}, 1000);
+}
+tickTimer();
+setInterval(tickTimer, 1000);
+
+function showExpiredOverlay() {
+  // Disable input controls + show full-screen expired panel
+  sendBtn.disabled = true;
+  messageEl.disabled = true;
+  messageEl.placeholder = 'Demo expired';
+  document.querySelectorAll('.starter').forEach(b => b.disabled = true);
+
+  // Inject expired overlay if not already there
+  if (document.getElementById('expired-overlay')) return;
+  const overlay = document.createElement('div');
+  overlay.id = 'expired-overlay';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(10,10,20,0.92);backdrop-filter:blur(6px);z-index:200;display:flex;align-items:center;justify-content:center;animation:fade .25s ease;';
+  overlay.innerHTML = `
+    <div style="background:#11111c;border:1px solid #1f1f30;border-radius:16px;padding:36px 32px;max-width:420px;text-align:center;">
+      <div style="font-size:38px;margin-bottom:14px;">⏱️</div>
+      <h2 style="font-size:20px;font-weight:800;letter-spacing:-0.4px;margin-bottom:10px;">Your 15-min demo expired</h2>
+      <p style="color:#8a8aa0;font-size:13px;line-height:1.55;margin-bottom:22px;">Liked it? Reach out at <a href="mailto:sales@partyard.eu" style="color:var(--accent);">sales@partyard.eu</a> or start a fresh sandbox with no history.</p>
+      <button onclick="resetDemo(this)" style="background:var(--accent);color:#000;border:none;padding:12px 26px;border-radius:10px;font-weight:700;font-size:13px;text-transform:uppercase;letter-spacing:0.8px;cursor:pointer;width:100%;">Start fresh demo →</button>
+      <a href="/" style="display:block;margin-top:14px;color:#8a8aa0;font-size:12px;text-decoration:none;">← back to all agents</a>
+    </div>`;
+  document.body.appendChild(overlay);
+}
+
+async function resetDemo(btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Loading…'; }
+  try {
+    const res = await fetch(RESET_URL, {
+      method: 'POST',
+      headers: { 'X-CSRF-TOKEN': CSRF, 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json' },
+    });
+    const data = await res.json().catch(() => ({}));
+    location.href = data.redirect || location.pathname;
+  } catch (_) {
+    location.reload();  // fallback — fresh page = fresh session if cookie was nuked
+  }
+}
 
 function addMsg(role, text, isError = false) {
   if (emptyEl) emptyEl.style.display = 'none';
@@ -326,6 +377,15 @@ async function send() {
       body: 'message=' + encodeURIComponent(text),
     });
 
+    // 410 Gone = sandbox expired server-side. Show expired overlay
+    // immediately (catches edge case where client clock drifted past 0).
+    if (res.status === 410) {
+      expired = true;
+      showExpiredOverlay();
+      aiBubble.remove();
+      sendBtn.disabled = true;
+      return;
+    }
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
     const reader = res.body.getReader();

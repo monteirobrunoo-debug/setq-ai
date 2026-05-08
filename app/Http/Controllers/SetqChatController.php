@@ -35,36 +35,72 @@ class SetqChatController extends Controller
         'insights'   => SetqInsightsAgent::class,
     ];
 
+    /** Hard session window — expires_at does NOT slide forward. */
+    public const SESSION_MINUTES = 15;
+
     /**
      * GET /demo/{agent} — render the chat page + ensure session cookie.
+     *
+     * Initialises the session record with a fixed expires_at so the
+     * 15-min window is enforced server-side and doesn't reset on each
+     * chat turn (was the bug — user could chat indefinitely).
      */
     public function show(Request $request, string $agent)
     {
         $sessionId = $this->ensureSession($request);
+        $cacheKey  = "setq:demo:{$agent}:{$sessionId}";
+
+        // First visit OR cookie reused but cache evicted → seed new window
+        if (!Cache::has($cacheKey)) {
+            $expiresAt = now()->addMinutes(self::SESSION_MINUTES);
+            Cache::put($cacheKey, [
+                'expires_at' => $expiresAt->timestamp,
+                'history'    => [],
+            ], $expiresAt);
+        }
+
+        $session   = Cache::get($cacheKey);
+        $expiresAt = (int) ($session['expires_at'] ?? now()->addMinutes(self::SESSION_MINUTES)->timestamp);
 
         return response()
             ->view('setq.chat', [
-                'agent'     => $agent,
-                'sessionId' => $sessionId,
-                'meta'      => $this->agentMeta($agent),
+                'agent'        => $agent,
+                'sessionId'    => $sessionId,
+                'meta'         => $this->agentMeta($agent),
+                'expiresAtSec' => $expiresAt,                              // unix ts
+                'remainingSec' => max(0, $expiresAt - time()),             // for UI countdown
             ])
-            ->cookie('setq_demo', $sessionId, 15, '/', null, true, true, false, 'lax');
+            ->cookie('setq_demo', $sessionId, self::SESSION_MINUTES, '/', null, true, true, false, 'lax');
     }
 
     /**
-     * POST /demo/{agent}/stream — SSE chat.
+     * POST /demo/{agent}/stream — SSE chat. Returns 410 Gone if session expired.
      */
-    public function stream(Request $request, string $agent): StreamedResponse
+    public function stream(Request $request, string $agent)
     {
-        $sessionId = $request->cookie('setq_demo') ?: $this->ensureSession($request);
+        $sessionId = $request->cookie('setq_demo') ?: '';
         $message   = trim((string) $request->input('message', ''));
 
         if ($message === '') {
             abort(422, 'Empty message');
         }
+        if (!$sessionId) {
+            return response()->json(['error' => 'session_missing'], 410);
+        }
 
         $cacheKey = "setq:demo:{$agent}:{$sessionId}";
-        $history  = Cache::get($cacheKey, []);
+        $session  = Cache::get($cacheKey);
+
+        // Server-side hard expiry: if cache evicted or window passed, lock out
+        if (!$session || (int) ($session['expires_at'] ?? 0) <= time()) {
+            return response()->json([
+                'error'   => 'session_expired',
+                'message' => 'Your 15-minute demo has expired. Start a fresh sandbox to continue.',
+            ], 410);
+        }
+
+        $expiresAt = (int) $session['expires_at'];
+        $history   = (array) ($session['history'] ?? []);
 
         // Cap history to last 10 turns (memory + token budget)
         if (count($history) > 20) $history = array_slice($history, -20);
@@ -81,7 +117,7 @@ class SetqChatController extends Controller
         $ip        = $request->ip();
         $userAgent = mb_substr((string) $request->userAgent(), 0, 500);
 
-        return response()->stream(function () use ($instance, $message, $history, $cacheKey, $sessionId, $agent, $ip, $userAgent, $started, &$full, &$errMsg) {
+        return response()->stream(function () use ($instance, $message, $history, $cacheKey, $sessionId, $agent, $ip, $userAgent, $started, $expiresAt, &$full, &$errMsg) {
             // Disable PHP output buffering for true streaming
             while (ob_get_level() > 0) ob_end_flush();
 
@@ -96,13 +132,18 @@ class SetqChatController extends Controller
                 @flush();
             }
 
-            // Persist the turn (15-min TTL, slides forward on each interaction)
+            // Persist new turn — TTL is FIXED at the original expires_at,
+            // so the 15-min window stays hard (does not slide on activity).
             if ($full !== '') {
                 $newHistory = array_merge($history, [
                     ['role' => 'user',      'content' => $message],
                     ['role' => 'assistant', 'content' => $full],
                 ]);
-                Cache::put($cacheKey, $newHistory, now()->addMinutes(15));
+                $remainingSec = max(60, $expiresAt - time());
+                Cache::put($cacheKey, [
+                    'expires_at' => $expiresAt,
+                    'history'    => $newHistory,
+                ], $remainingSec);
             }
 
             // Best-effort usage log — failure here doesn't break the response
@@ -134,6 +175,22 @@ class SetqChatController extends Controller
             'X-Accel-Buffering' => 'no',  // tell nginx to not buffer
             'Connection'        => 'keep-alive',
         ]);
+    }
+
+    /**
+     * POST /demo/{agent}/reset — wipe sandbox + cookie, redirect to fresh demo.
+     * Triggered from the "Start fresh demo" button shown after a 410 expiry.
+     */
+    public function reset(Request $request, string $agent)
+    {
+        $sessionId = $request->cookie('setq_demo');
+        if ($sessionId) {
+            Cache::forget("setq:demo:{$agent}:{$sessionId}");
+        }
+        return response()->json([
+            'ok'       => true,
+            'redirect' => route('demo.chat', $agent),
+        ])->cookie('setq_demo', '', -2628000, '/');  // expire cookie immediately
     }
 
     /** Issue a 15-min anonymous sandbox session id. */

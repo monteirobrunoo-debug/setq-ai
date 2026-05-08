@@ -27,9 +27,18 @@ class LeadController extends Controller
 
         $sessionId = (string) $request->cookie('setq_demo', '');
         $cacheKey  = "setq:demo:{$data['agent']}:{$sessionId}";
-        $history   = Cache::get($cacheKey, []);
-        // Last 10 turns max (privacy + email size)
-        $transcript = array_slice($history, -10);
+        $session   = Cache::get($cacheKey);
+        // Cache value can be:
+        //   • new format: ['expires_at' => ts, 'history' => [...]]
+        //   • legacy: just an array of messages (pre-2026-05-08 expiry fix)
+        if (is_array($session) && isset($session['history'])) {
+            $history = $session['history'];
+        } elseif (is_array($session)) {
+            $history = $session;
+        } else {
+            $history = [];
+        }
+        $transcript = array_slice($history, -10);  // last 10 turns max
 
         $lead = Lead::create([
             'email'      => $data['email'],

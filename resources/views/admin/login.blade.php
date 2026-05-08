@@ -20,7 +20,7 @@
   @if(!empty($error))
     <div class="err">Wrong password.</div>
   @endif
-  <form method="POST">
+  <form method="POST" action="/admin/login">
     @csrf
     <input type="password" name="password" placeholder="Password" autofocus required>
     <button type="submit">Sign in</button>

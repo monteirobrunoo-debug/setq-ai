@@ -159,15 +159,120 @@
   <button id="send">Send</button>
 </div>
 
+<!-- ── Lead capture slider — appears after ≥3 msgs or ≥5 min ── -->
+<style>
+  #lead-capture {
+    position: fixed; right: 24px; bottom: 24px; width: min(360px, calc(100vw - 48px));
+    background: var(--bg2); border: 1px solid var(--border); border-radius: 14px;
+    padding: 18px 20px; z-index: 50;
+    box-shadow: 0 18px 48px rgba(0,0,0,.6);
+    transform: translateY(120%); transition: transform .3s ease;
+  }
+  #lead-capture.open { transform: translateY(0); }
+  #lead-capture .lc-close {
+    position: absolute; top: 10px; right: 12px;
+    background: none; border: none; color: var(--muted); font-size: 18px; cursor: pointer; line-height: 1;
+  }
+  #lead-capture .lc-close:hover { color: var(--text); }
+  #lead-capture h3 {
+    font-size: 14px; font-weight: 800; margin-bottom: 4px; letter-spacing: -0.2px;
+  }
+  #lead-capture h3 span { color: var(--accent); }
+  #lead-capture p {
+    color: var(--muted); font-size: 12px; line-height: 1.5; margin-bottom: 12px;
+  }
+  #lead-capture input, #lead-capture textarea {
+    width: 100%; box-sizing: border-box; background: var(--bg3); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px; padding: 9px 11px;
+    font-size: 13px; font-family: inherit; margin-bottom: 8px; outline: none;
+  }
+  #lead-capture input:focus, #lead-capture textarea:focus { border-color: var(--accent); }
+  #lead-capture textarea { resize: vertical; min-height: 56px; }
+  #lead-capture .lc-disclosure {
+    color: var(--muted); font-size: 10px; line-height: 1.45;
+    background: rgba(255, 200, 80, 0.06); border: 1px solid rgba(255, 200, 80, 0.2);
+    padding: 7px 10px; border-radius: 6px; margin-bottom: 10px;
+  }
+  #lead-capture button.lc-submit {
+    width: 100%; background: var(--accent); color: #000; border: none;
+    padding: 10px; border-radius: 8px; font-weight: 700; font-size: 12px;
+    text-transform: uppercase; letter-spacing: 0.8px; cursor: pointer;
+  }
+  #lead-capture button.lc-submit:disabled { opacity: .4; cursor: not-allowed; }
+  #lead-capture .lc-success {
+    text-align: center; padding: 16px 0; color: var(--accent); font-weight: 600; font-size: 14px;
+  }
+</style>
+<div id="lead-capture">
+  <button class="lc-close" onclick="document.getElementById('lead-capture').classList.remove('open')" aria-label="Close">×</button>
+  <div id="lc-form-wrap">
+    <h3>Liked the <span>{{ $meta['name'] }}</span> demo?</h3>
+    <p>Leave your email — we'll set up a 30-min call with the SETQ.AI team to scope a real deployment.</p>
+    <form id="lead-form" onsubmit="return submitLead(event)">
+      <input type="email"   name="email"    placeholder="you@company.com" required>
+      <input type="text"    name="company"  placeholder="Company (optional)">
+      <textarea            name="use_case" placeholder="What would you automate first? (optional)"></textarea>
+      <div class="lc-disclosure">
+        ⚠ The chat we just had will be shared with our team to prep the call.
+      </div>
+      <button type="submit" class="lc-submit" id="lc-submit-btn">Talk to a real person →</button>
+    </form>
+  </div>
+  <div id="lc-success-wrap" style="display:none;">
+    <div class="lc-success">✓ Thanks — we'll be in touch within 1 working day.</div>
+  </div>
+</div>
+
 <script>
 const AGENT       = @json($agent);
 const STREAM_URL  = "{{ route('demo.stream', $agent) }}";
+const LEAD_URL    = "{{ route('leads.store') }}";
 const CSRF        = "{{ csrf_token() }}";
 const chatEl      = document.getElementById('chat');
 const emptyEl     = document.getElementById('empty');
 const messageEl   = document.getElementById('message');
 const sendBtn     = document.getElementById('send');
 const timerEl     = document.getElementById('timer');
+
+// ── Lead capture trigger (≥3 user msgs OR ≥5 min) ─────────────
+let userMsgCount   = 0;
+const sessionStart = Date.now();
+const LEAD_OPENED_KEY = 'setq_lead_opened_' + AGENT;
+
+function maybeShowLeadCapture() {
+  if (sessionStorage.getItem(LEAD_OPENED_KEY)) return;
+  const minutes = (Date.now() - sessionStart) / 60_000;
+  if (userMsgCount >= 3 || minutes >= 5) {
+    document.getElementById('lead-capture').classList.add('open');
+    sessionStorage.setItem(LEAD_OPENED_KEY, '1');
+  }
+}
+setInterval(maybeShowLeadCapture, 30_000);
+
+async function submitLead(e) {
+  e.preventDefault();
+  const btn  = document.getElementById('lc-submit-btn');
+  btn.disabled = true; btn.textContent = 'Sending…';
+
+  const form = e.target;
+  const data = new FormData(form);
+  data.append('agent', AGENT);
+
+  try {
+    const res = await fetch(LEAD_URL, {
+      method: 'POST',
+      headers: { 'X-CSRF-TOKEN': CSRF, 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json' },
+      body: data,
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    document.getElementById('lc-form-wrap').style.display = 'none';
+    document.getElementById('lc-success-wrap').style.display = 'block';
+  } catch (err) {
+    btn.disabled = false; btn.textContent = 'Try again';
+    alert('Could not send: ' + err.message);
+  }
+  return false;
+}
 
 // 15-min countdown — visual only; server enforces via Cache TTL
 let secondsLeft = 15 * 60;
@@ -201,6 +306,8 @@ async function send() {
   if (!text || sendBtn.disabled) return;
 
   addMsg('user', text);
+  userMsgCount++;
+  maybeShowLeadCapture();
   messageEl.value = '';
   messageEl.style.height = 'auto';
   sendBtn.disabled = true;

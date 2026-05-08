@@ -60,16 +60,36 @@ abstract class BaseSetqAgent implements AgentInterface
         return $data['content'][0]['text'] ?? '';
     }
 
+    /**
+     * Per-stream usage breakdown — populated as Anthropic SSE arrives so the
+     * controller can write a row to `usage_logs` after each turn.
+     *
+     * Anthropic emits usage info in two events:
+     *   • `message_start.message.usage`  → input + cache_read tokens
+     *   • `message_delta.usage`          → output_tokens (final count)
+     *
+     * @var array{input_tokens:int,output_tokens:int,cache_read_tokens:int,model:string}
+     */
+    public array $lastUsage = [
+        'input_tokens'      => 0,
+        'output_tokens'     => 0,
+        'cache_read_tokens' => 0,
+        'model'             => '',
+    ];
+
     public function stream(
         string|array $message,
         array $history,
         callable $onChunk,
         ?callable $heartbeat = null
     ): string {
+        $model = config('services.anthropic.model', 'claude-sonnet-4-6');
+        $this->lastUsage = ['input_tokens' => 0, 'output_tokens' => 0, 'cache_read_tokens' => 0, 'model' => $model];
+
         $response = $this->client->post('/v1/messages', [
             'stream' => true,
             'json'   => [
-                'model'      => config('services.anthropic.model', 'claude-sonnet-4-6'),
+                'model'      => $model,
                 'max_tokens' => 4096,
                 'system'     => $this->systemPrompt,
                 'messages'   => array_merge($history, [['role' => 'user', 'content' => $message]]),
@@ -100,10 +120,25 @@ abstract class BaseSetqAgent implements AgentInterface
                 $evt  = json_decode($json, true);
                 if (!is_array($evt)) continue;
 
-                // Anthropic clean end → break antes de qualquer read() final
-                if (($evt['type'] ?? '') === 'message_stop') break 2;
+                $type = $evt['type'] ?? '';
 
-                if (($evt['type'] ?? '') === 'content_block_delta'
+                // Anthropic clean end → break antes de qualquer read() final
+                if ($type === 'message_stop') break 2;
+
+                // Capture token usage from the events that carry it
+                if ($type === 'message_start' && isset($evt['message']['usage'])) {
+                    $u = $evt['message']['usage'];
+                    $this->lastUsage['input_tokens']      = (int) ($u['input_tokens'] ?? 0);
+                    $this->lastUsage['cache_read_tokens'] = (int) ($u['cache_read_input_tokens'] ?? 0);
+                    if (isset($evt['message']['model'])) {
+                        $this->lastUsage['model'] = (string) $evt['message']['model'];
+                    }
+                }
+                if ($type === 'message_delta' && isset($evt['usage']['output_tokens'])) {
+                    $this->lastUsage['output_tokens'] = (int) $evt['usage']['output_tokens'];
+                }
+
+                if ($type === 'content_block_delta'
                     && ($evt['delta']['type'] ?? '') === 'text_delta') {
                     $text = $evt['delta']['text'] ?? '';
                     if ($text !== '') {

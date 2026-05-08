@@ -115,4 +115,11 @@ return [
         'name' => env('MAIL_FROM_NAME', env('APP_NAME', 'Laravel')),
     ],
 
+    /*
+    | Lead capture target — email address that gets notified each time a
+    | buyer leaves their contact info on the demo. Set LEAD_NOTIFY_EMAIL
+    | in .env. If unset, leads are still stored in DB but no email goes out.
+    */
+    'lead_notify_to' => env('LEAD_NOTIFY_EMAIL'),
+
 ];

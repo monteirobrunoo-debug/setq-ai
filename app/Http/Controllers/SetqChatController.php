@@ -3,12 +3,15 @@
 namespace App\Http\Controllers;
 
 use App\Agents\AgentInterface;
+use App\Agents\BaseSetqAgent;
 use App\Agents\SetqAssistantAgent;
 use App\Agents\SetqGrowthAgent;
 use App\Agents\SetqInsightsAgent;
 use App\Agents\SetqOperationsAgent;
+use App\Models\UsageLog;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Log;
 use Symfony\Component\HttpFoundation\StreamedResponse;
 
 /**
@@ -69,11 +72,16 @@ class SetqChatController extends Controller
         $agentClass = self::AGENTS[$agent] ?? null;
         if (!$agentClass) abort(404);
 
-        /** @var AgentInterface $instance */
+        /** @var BaseSetqAgent $instance */
         $instance = new $agentClass();
         $full     = '';
+        $started  = microtime(true);
+        $errMsg   = null;
 
-        return response()->stream(function () use ($instance, $message, $history, $cacheKey, &$full) {
+        $ip        = $request->ip();
+        $userAgent = mb_substr((string) $request->userAgent(), 0, 500);
+
+        return response()->stream(function () use ($instance, $message, $history, $cacheKey, $sessionId, $agent, $ip, $userAgent, $started, &$full, &$errMsg) {
             // Disable PHP output buffering for true streaming
             while (ob_get_level() > 0) ob_end_flush();
 
@@ -83,17 +91,40 @@ class SetqChatController extends Controller
                     @flush();
                 });
             } catch (\Throwable $e) {
-                echo 'data: ' . json_encode(['error' => $e->getMessage()]) . "\n\n";
+                $errMsg = $e->getMessage();
+                echo 'data: ' . json_encode(['error' => $errMsg]) . "\n\n";
                 @flush();
-                return;
             }
 
             // Persist the turn (15-min TTL, slides forward on each interaction)
-            $newHistory = array_merge($history, [
-                ['role' => 'user',      'content' => $message],
-                ['role' => 'assistant', 'content' => $full],
-            ]);
-            Cache::put($cacheKey, $newHistory, now()->addMinutes(15));
+            if ($full !== '') {
+                $newHistory = array_merge($history, [
+                    ['role' => 'user',      'content' => $message],
+                    ['role' => 'assistant', 'content' => $full],
+                ]);
+                Cache::put($cacheKey, $newHistory, now()->addMinutes(15));
+            }
+
+            // Best-effort usage log — failure here doesn't break the response
+            try {
+                $u = $instance->lastUsage;
+                UsageLog::create([
+                    'session_id'        => $sessionId,
+                    'agent'             => $agent,
+                    'ip'                => $ip,
+                    'user_agent'        => $userAgent,
+                    'model'             => $u['model'] ?: config('services.anthropic.model'),
+                    'input_tokens'      => (int) $u['input_tokens'],
+                    'output_tokens'     => (int) $u['output_tokens'],
+                    'cache_read_tokens' => (int) $u['cache_read_tokens'],
+                    'cost_usd'          => UsageLog::computeCost($u['model'] ?: 'sonnet', $u['input_tokens'], $u['output_tokens'], $u['cache_read_tokens']),
+                    'latency_ms'        => (int) ((microtime(true) - $started) * 1000),
+                    'errored'           => $errMsg !== null,
+                    'error_msg'         => $errMsg ? mb_substr($errMsg, 0, 250) : null,
+                ]);
+            } catch (\Throwable $logErr) {
+                Log::warning('UsageLog failed: ' . $logErr->getMessage());
+            }
 
             echo "data: [DONE]\n\n";
             @flush();

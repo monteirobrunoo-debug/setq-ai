@@ -2,6 +2,7 @@
 
 namespace App\Agents;
 
+use App\Services\BookSearchService;
 use GuzzleHttp\Client;
 
 /**
@@ -25,6 +26,8 @@ abstract class BaseSetqAgent implements AgentInterface
     protected string $promptFile;
     /** agent slug — defined by subclass */
     protected string $name;
+    /** which book corpus this agent reads — back_office | front_office | null */
+    protected ?string $bookDomain = null;
 
     public function __construct()
     {
@@ -45,13 +48,29 @@ abstract class BaseSetqAgent implements AgentInterface
         ]);
     }
 
+    /**
+     * Build the system prompt for this turn — base persona + book context
+     * if we have a corpus + the latest user message keywords match anything.
+     */
+    protected function buildSystemPrompt(string|array $message): string
+    {
+        if (!$this->bookDomain) return $this->systemPrompt;
+
+        $userText = is_array($message)
+            ? implode(' ', array_map(fn($c) => is_array($c) ? ($c['text'] ?? '') : (string) $c, $message))
+            : (string) $message;
+
+        $bookCtx = app(BookSearchService::class)->asPromptBlock($userText, $this->bookDomain, 3);
+        return $bookCtx === '' ? $this->systemPrompt : $this->systemPrompt . "\n\n" . $bookCtx;
+    }
+
     public function chat(string|array $message, array $history = []): string
     {
         $response = $this->client->post('/v1/messages', [
             'json' => [
                 'model'      => config('services.anthropic.model', 'claude-sonnet-4-6'),
                 'max_tokens' => 4096,
-                'system'     => $this->systemPrompt,
+                'system'     => $this->buildSystemPrompt($message),
                 'messages'   => array_merge($history, [['role' => 'user', 'content' => $message]]),
             ],
         ]);
@@ -91,7 +110,7 @@ abstract class BaseSetqAgent implements AgentInterface
             'json'   => [
                 'model'      => $model,
                 'max_tokens' => 4096,
-                'system'     => $this->systemPrompt,
+                'system'     => $this->buildSystemPrompt($message),
                 'messages'   => array_merge($history, [['role' => 'user', 'content' => $message]]),
                 'stream'     => true,
             ],
